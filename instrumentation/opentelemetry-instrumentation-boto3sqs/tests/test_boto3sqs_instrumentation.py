@@ -184,6 +184,7 @@ class TestBoto3SQSInstrumentation(TestBase):
     @staticmethod
     def _reset_instrumentor():
         Boto3SQSInstrumentor.received_messages_spans.clear()
+        Boto3SQSInstrumentor.pending_message_metadata.clear()
         Boto3SQSInstrumentor.current_span_related_to_token = None
         Boto3SQSInstrumentor.current_context_token = None
 
@@ -400,7 +401,7 @@ class TestBoto3SQSInstrumentation(TestBase):
         for msg in response["Messages"]:
             msg_id = msg["MessageId"]
             attrs = msg_def[msg_id]
-            with self._mocked_endpoint(None):
+            with self._mocked_endpoint({}):
                 self._client.delete_message(
                     QueueUrl=self._queue_url, ReceiptHandle=attrs["receipt"]
                 )

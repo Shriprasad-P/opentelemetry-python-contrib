@@ -18,6 +18,8 @@ Usage
 ---
 """
 
+from __future__ import annotations
+
 import logging
 from typing import Any, Collection, Dict, Generator, List, Mapping, Optional
 
@@ -84,6 +86,7 @@ boto3sqs_setter = Boto3SQSSetter()
 
 class Boto3SQSInstrumentor(BaseInstrumentor):
     received_messages_spans: Dict[str, Span] = {}
+    pending_message_metadata: Dict[str, Dict[str, Any]] = {}
     current_span_related_to_token: Span = None
     current_context_token = None
 
@@ -106,17 +109,41 @@ class Boto3SQSInstrumentor(BaseInstrumentor):
             receipt_handle = retval.get("ReceiptHandle")
             if not receipt_handle:
                 return retval
+
+            # End the previous span if there was one and it's still recording
+            if Boto3SQSInstrumentor.current_span_related_to_token:
+                if Boto3SQSInstrumentor.current_span_related_to_token.is_recording():
+                    Boto3SQSInstrumentor.current_span_related_to_token.end()
+                if Boto3SQSInstrumentor.current_context_token:
+                    context.detach(Boto3SQSInstrumentor.current_context_token)
+                    Boto3SQSInstrumentor.current_context_token = None
+                Boto3SQSInstrumentor.current_span_related_to_token = None
+
+            # Start span for this message if not already started
             started_span = Boto3SQSInstrumentor.received_messages_spans.get(
                 receipt_handle
             )
             if started_span is None:
-                return retval
-            if Boto3SQSInstrumentor.current_context_token:
-                context.detach(Boto3SQSInstrumentor.current_context_token)
-            Boto3SQSInstrumentor.current_context_token = context.attach(
-                trace.set_span_in_context(started_span)
-            )
-            Boto3SQSInstrumentor.current_span_related_to_token = started_span
+                # Create the processing span now (on first access)
+                metadata = Boto3SQSInstrumentor.pending_message_metadata.get(receipt_handle)
+                if metadata:
+                    started_span = metadata["instrumentor"]._create_processing_span_on_access(
+                        metadata["queue_name"],
+                        metadata["queue_url"],
+                        receipt_handle,
+                        metadata["message"],
+                    )
+                    Boto3SQSInstrumentor.received_messages_spans[receipt_handle] = started_span
+                    Boto3SQSInstrumentor.pending_message_metadata.pop(receipt_handle, None)
+                else:
+                    return retval
+
+            # Set the span context
+            if started_span:
+                Boto3SQSInstrumentor.current_context_token = context.attach(
+                    trace.set_span_in_context(started_span)
+                )
+                Boto3SQSInstrumentor.current_span_related_to_token = started_span
             return retval
 
         def __iter__(self) -> Generator:
@@ -160,6 +187,9 @@ class Boto3SQSInstrumentor(BaseInstrumentor):
 
     @staticmethod
     def _safe_end_processing_span(receipt_handle: str) -> None:
+        # Clean up any pending metadata
+        Boto3SQSInstrumentor.pending_message_metadata.pop(receipt_handle, None)
+
         started_span: Span = Boto3SQSInstrumentor.received_messages_spans.pop(
             receipt_handle, None
         )
@@ -171,20 +201,21 @@ class Boto3SQSInstrumentor(BaseInstrumentor):
                 if Boto3SQSInstrumentor.current_context_token:
                     context.detach(Boto3SQSInstrumentor.current_context_token)
                     Boto3SQSInstrumentor.current_context_token = None
-            started_span.end()
+            if started_span.is_recording():
+                started_span.end()
 
     @staticmethod
     def _extract_queue_name_from_url(queue_url: str) -> str:
         # A Queue name cannot have the `/` char, therefore we can return the part after the last /
         return queue_url.rsplit("/", maxsplit=1)[-1]
 
-    def _create_processing_span(
+    def _create_processing_span_on_access(
         self,
         queue_name: str,
         queue_url: str,
         receipt_handle: str,
         message: Dict[str, Any],
-    ) -> None:
+    ) -> Span:
         message_attributes = message.get("MessageAttributes", {})
         links = []
         ctx = propagate.extract(message_attributes, getter=boto3sqs_getter)
@@ -195,16 +226,29 @@ class Boto3SQSInstrumentor(BaseInstrumentor):
         span = self._tracer.start_span(
             name=f"{queue_name} process", links=links, kind=SpanKind.CONSUMER
         )
-        with trace.use_span(span):
-            message_id = message.get("MessageId")
-            Boto3SQSInstrumentor.received_messages_spans[receipt_handle] = span
-            Boto3SQSInstrumentor._enrich_span(
-                span,
-                queue_name,
-                queue_url,
-                message_id=message_id,
-                operation=MessagingOperationValues.PROCESS,
-            )
+        message_id = message.get("MessageId")
+        Boto3SQSInstrumentor._enrich_span(
+            span,
+            queue_name,
+            queue_url,
+            message_id=message_id,
+            operation=MessagingOperationValues.PROCESS,
+        )
+        return span
+
+    def _store_message_metadata(
+        self,
+        queue_name: str,
+        queue_url: str,
+        receipt_handle: str,
+        message: Dict[str, Any],
+    ) -> None:
+        Boto3SQSInstrumentor.pending_message_metadata[receipt_handle] = {
+            "queue_name": queue_name,
+            "queue_url": queue_url,
+            "message": message,
+            "instrumentor": self,
+        }
 
     def _wrap_send_message(self, sqs_class: type) -> None:
         def send_wrapper(wrapped, instance, args, kwargs):
@@ -320,7 +364,7 @@ class Boto3SQSInstrumentor(BaseInstrumentor):
                     Boto3SQSInstrumentor._safe_end_processing_span(
                         receipt_handle
                     )
-                    self._create_processing_span(
+                    self._store_message_metadata(
                         queue_name, queue_url, receipt_handle, message
                     )
                 retval["Messages"] = Boto3SQSInstrumentor.ContextableList(
